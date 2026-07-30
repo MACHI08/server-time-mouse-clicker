@@ -18,10 +18,8 @@ from urllib.request import Request, urlopen
 # 확인하려는 서버 주소로 변경하세요.
 SERVER_URL = "https://store.frommyarti.com/"
 
-# 프로그램 버전과 네이비즘 비교 기준 사이트 보정값
-APP_VERSION = "1.5.0"
-SERVER_TIME_ADJUSTMENT_MS = 0
-USE_HTTP_SERVER_SECOND_OFFSET = False
+# 프로그램 버전
+APP_VERSION = "1.6.0"
 
 # 예약 좌클릭 설정입니다. 빈 시각은 예약 기능을 비활성화합니다.
 # 입력 예시: "2026-07-30 12:00:00.000"
@@ -37,9 +35,14 @@ SYNC_INTERVAL_SECONDS = 10
 SYNC_SAMPLE_COUNT = 5
 SERVER_OFFSET_CONFIRMATIONS = 3
 
-# PC 시계의 밀리초 오차를 보정할 NTP 설정
-NTP_SERVER = "time.google.com"
-NTP_SAMPLE_COUNT = 3
+# PC 시계의 밀리초 오차를 자동 보정할 NTP 설정
+NTP_SERVERS = (
+    "time.google.com",
+    "time.cloudflare.com",
+    "time.windows.com",
+    "pool.ntp.org",
+)
+NTP_SAMPLE_COUNT = len(NTP_SERVERS)
 NTP_TIMEOUT_SECONDS = 1
 NTP_EPOCH_DELTA = 2_208_988_800
 
@@ -274,13 +277,13 @@ class ServerClock:
         self._offset_status = ""
         self._status = "서버 시간 동기화 대기 중"
 
-    def _fetch_ntp_sample(self):
+    def _fetch_ntp_sample(self, ntp_server):
         packet = b"\x1b" + 47 * b"\0"
 
         with socket.socket(socket.AF_INET, socket.SOCK_DGRAM) as client:
             client.settimeout(NTP_TIMEOUT_SECONDS)
             started = time.time()
-            client.sendto(packet, (NTP_SERVER, 123))
+            client.sendto(packet, (ntp_server, 123))
             data, _ = client.recvfrom(48)
             finished = time.time()
 
@@ -302,6 +305,7 @@ class ServerClock:
         )
 
         return {
+            "server": ntp_server,
             "offset_seconds": offset_seconds,
             "delay_seconds": max(0.0, network_delay_seconds),
         }
@@ -399,27 +403,34 @@ class ServerClock:
 
     def sync(self):
         ntp_samples = []
-        for _ in range(NTP_SAMPLE_COUNT):
+        for index in range(NTP_SAMPLE_COUNT):
+            ntp_server = NTP_SERVERS[index % len(NTP_SERVERS)]
             try:
-                ntp_samples.append(self._fetch_ntp_sample())
+                ntp_samples.append(
+                    self._fetch_ntp_sample(ntp_server)
+                )
             except (OSError, ValueError, TimeoutError):
                 pass
 
         if ntp_samples:
-            best_ntp_sample = min(
-                ntp_samples,
-                key=lambda sample: sample["delay_seconds"],
+            ntp_offset_seconds = median(
+                sample["offset_seconds"]
+                for sample in ntp_samples
             )
-            ntp_offset_seconds = best_ntp_sample["offset_seconds"]
             with self._lock:
                 self._ntp_offset_seconds = ntp_offset_seconds
-            ntp_status = f"NTP {ntp_offset_seconds * 1000:+.1f} ms"
+            ntp_status = (
+                f"NTP 자동 {ntp_offset_seconds * 1000:+.1f} ms "
+                f"({len(ntp_samples)}/{NTP_SAMPLE_COUNT})"
+            )
         else:
             with self._lock:
                 ntp_offset_seconds = self._ntp_offset_seconds
             if ntp_offset_seconds is None:
-                ntp_offset_seconds = 0.0
-                ntp_status = "PC 시계 기준"
+                with self._lock:
+                    self._server_utc = None
+                    self._status = "동기화 실패: NTP 서버 연결 불가"
+                return
             else:
                 ntp_status = (
                     f"NTP 재사용 {ntp_offset_seconds * 1000:+.1f} ms"
@@ -451,19 +462,12 @@ class ServerClock:
         measured_offset = int(
             median(sample["offset_seconds"] for sample in samples)
         )
-        if USE_HTTP_SERVER_SECOND_OFFSET:
-            selected_offset = self._select_stable_server_offset(
-                measured_offset,
-                samples,
-            )
-            server_offset_status = f"서버 초 {selected_offset:+d} s"
-        else:
-            selected_offset = 0
-            self._stable_server_offset_seconds = 0
-            self._pending_server_offset_seconds = None
-            self._pending_offset_confirmations = 0
-            self._offset_status = ""
-            server_offset_status = "서버 초 +0 s 고정"
+        selected_offset = 0
+        self._stable_server_offset_seconds = 0
+        self._pending_server_offset_seconds = None
+        self._pending_offset_confirmations = 0
+        self._offset_status = ""
+        server_offset_status = "서버 보정 없음"
         matching_samples = [
             sample
             for sample in samples
@@ -481,7 +485,6 @@ class ServerClock:
             best_sample["finished_wall_ns"] / 1_000_000_000
             + ntp_offset_seconds
             + selected_offset
-            + SERVER_TIME_ADJUSTMENT_MS / 1000
         )
         estimated_server_utc = datetime.fromtimestamp(
             estimated_server_timestamp,
@@ -716,10 +719,7 @@ class ServerTimeViewer(tk.Tk):
             self.cursor_text.set(f"현재 마우스 좌표: X={x}, Y={y}")
 
         if latency_ms is not None:
-            self.latency_text.set(
-                f"응답 지연: {latency_ms:.1f} ms | "
-                f"수동 보정: {SERVER_TIME_ADJUSTMENT_MS:+d} ms"
-            )
+            self.latency_text.set(f"응답 지연: {latency_ms:.1f} ms")
 
         if server_utc is not None:
             local_time = server_utc.astimezone()
