@@ -17,13 +17,13 @@ from urllib.request import Request, urlopen
 SERVER_URL = "https://store.frommyarti.com/"
 
 # 프로그램 버전과 네이비즘 비교 기준 사이트 보정값
-APP_VERSION = "1.3.0"
+APP_VERSION = "1.4.0"
 SERVER_TIME_ADJUSTMENT_MS = 0
 USE_HTTP_SERVER_SECOND_OFFSET = False
 
 # 예약 좌클릭 설정입니다. 빈 시각은 예약 기능을 비활성화합니다.
 # 입력 예시: "2026-07-30 12:00:00.000"
-TARGET_CLICK_TIME = "2026-07-30 12:05:59.000"
+TARGET_CLICK_TIME = "2026-07-30 12:00:00.000"
 CLICK_MAX_LATE_SECONDS = 2
 
 # 서버 시간 재동기화 간격(초)과 한 번에 측정할 횟수
@@ -64,15 +64,24 @@ class ScheduledLeftClick:
     def __init__(self, clock, target_text, click_action):
         self.clock = clock
         self.click_action = click_action
+        self._lock = threading.Lock()
+        self._generation = 0
         self.target_utc = None
-        self.completed = False
+        self.completed = True
         self.triggered = False
         self.status = "좌클릭 예약: 비활성"
+        self.arm(target_text)
 
+    def arm(self, target_text):
         target_text = target_text.strip()
         if not target_text:
-            self.completed = True
-            return
+            with self._lock:
+                self._generation += 1
+                self.target_utc = None
+                self.completed = True
+                self.triggered = False
+                self.status = "좌클릭 예약: 비활성"
+            return True
 
         try:
             local_target = datetime.strptime(
@@ -80,58 +89,81 @@ class ScheduledLeftClick:
                 "%Y-%m-%d %H:%M:%S.%f",
             )
         except ValueError:
-            self.completed = True
-            self.status = (
-                "좌클릭 예약 오류: YYYY-MM-DD HH:MM:SS.mmm 형식 필요"
-            )
-            return
+            with self._lock:
+                self._generation += 1
+                self.target_utc = None
+                self.completed = True
+                self.triggered = False
+                self.status = (
+                    "좌클릭 예약 오류: YYYY-MM-DD HH:MM:SS.mmm 형식 필요"
+                )
+            return False
 
         local_timezone = datetime.now().astimezone().tzinfo
-        self.target_utc = local_target.replace(
+        target_utc = local_target.replace(
             tzinfo=local_timezone
         ).astimezone(timezone.utc)
-        self.status = (
-            f"좌클릭 예약: {target_text} | 현재 마우스 위치"
-        )
+
+        with self._lock:
+            self._generation += 1
+            self.target_utc = target_utc
+            self.completed = False
+            self.triggered = False
+            self.status = (
+                f"좌클릭 예약: {target_text} | 현재 마우스 위치"
+            )
+        return True
 
     def check(self):
-        if self.completed or self.target_utc is None:
-            return None
+        with self._lock:
+            if self.completed or self.target_utc is None:
+                return None
+            target_utc = self.target_utc
+            generation = self._generation
 
         server_utc, _, _ = self.clock.snapshot()
         if server_utc is None:
-            self.status = "좌클릭 예약: 서버 시간 동기화 대기 중"
+            with self._lock:
+                if generation == self._generation:
+                    self.status = "좌클릭 예약: 서버 시간 동기화 대기 중"
             return None
 
-        remaining_seconds = (
-            self.target_utc - server_utc
-        ).total_seconds()
+        remaining_seconds = (target_utc - server_utc).total_seconds()
         if remaining_seconds > 0:
             return remaining_seconds
 
         if -remaining_seconds > CLICK_MAX_LATE_SECONDS:
-            self.completed = True
-            self.status = "좌클릭 예약 취소: 목표 시각이 이미 지났습니다."
+            with self._lock:
+                if generation == self._generation:
+                    self.completed = True
+                    self.status = (
+                        "좌클릭 예약 취소: 목표 시각이 이미 지났습니다."
+                    )
             return None
+
+        with self._lock:
+            if generation != self._generation or self.completed:
+                return None
+            self.completed = True
 
         try:
             x, y = self.click_action()
-            self.triggered = True
-            self.status = (
-                f"좌클릭 실행 완료: 현재 좌표 ({x}, {y})"
-            )
+            with self._lock:
+                if generation == self._generation:
+                    self.triggered = True
+                    self.status = (
+                        f"좌클릭 실행 완료: 현재 좌표 ({x}, {y})"
+                    )
         except OSError as error:
-            self.status = f"좌클릭 실행 실패: {error}"
-        finally:
-            self.completed = True
+            with self._lock:
+                if generation == self._generation:
+                    self.status = f"좌클릭 실행 실패: {error}"
 
         return None
 
     def run(self, should_run):
-        while should_run() and not self.completed:
+        while should_run():
             remaining_seconds = self.check()
-            if self.completed:
-                return
 
             if remaining_seconds is None:
                 time.sleep(0.02)
@@ -396,7 +428,7 @@ class ServerTimeViewer(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"실시간 서버 시간 v{APP_VERSION}")
-        self.geometry("520x306")
+        self.geometry("520x350")
         self.resizable(False, False)
         self.overrideredirect(True)
 
@@ -417,6 +449,7 @@ class ServerTimeViewer(tk.Tk):
         self.date_text = tk.StringVar(value="----년 --월 --일")
         self.status_text = tk.StringVar(value="서버 시간 동기화 대기 중")
         self.latency_text = tk.StringVar(value="응답 지연: -- ms")
+        self.target_time_text = tk.StringVar(value=TARGET_CLICK_TIME)
         self.schedule_text = tk.StringVar(
             value=self.click_scheduler.status
         )
@@ -511,11 +544,31 @@ class ServerTimeViewer(tk.Tk):
             font=("맑은 고딕", 11),
         ).pack(pady=(2, 14))
 
+        schedule_frame = ttk.Frame(frame)
+        schedule_frame.pack(fill="x", pady=(0, 10))
+        ttk.Label(schedule_frame, text="목표 클릭 시각").pack(side="left")
+        target_entry = ttk.Entry(
+            schedule_frame,
+            textvariable=self.target_time_text,
+            width=26,
+        )
+        target_entry.pack(side="left", fill="x", expand=True, padx=(8, 6))
+        target_entry.bind("<Return>", self._apply_click_schedule)
+        ttk.Button(
+            schedule_frame,
+            text="예약 적용",
+            command=self._apply_click_schedule,
+        ).pack(side="right")
+
         ttk.Separator(frame).pack(fill="x", pady=(0, 10))
         ttk.Label(frame, textvariable=self.status_text).pack(anchor="w")
         ttk.Label(frame, textvariable=self.latency_text).pack(anchor="w")
         ttk.Label(frame, textvariable=self.schedule_text).pack(anchor="w")
         ttk.Label(frame, textvariable=self.cursor_text).pack(anchor="w")
+
+    def _apply_click_schedule(self, _event=None):
+        self.click_scheduler.arm(self.target_time_text.get())
+        self.schedule_text.set(self.click_scheduler.status)
 
     def _sync_loop(self):
         while self._running:
