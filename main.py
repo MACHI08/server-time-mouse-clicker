@@ -1,4 +1,5 @@
 import ctypes
+import json
 import socket
 import struct
 import threading
@@ -7,6 +8,7 @@ import tkinter as tk
 from ctypes import wintypes
 from datetime import datetime, timedelta, timezone
 from email.utils import parsedate_to_datetime
+from pathlib import Path
 from statistics import median
 from tkinter import ttk
 from urllib.error import HTTPError, URLError
@@ -17,7 +19,7 @@ from urllib.request import Request, urlopen
 SERVER_URL = "https://store.frommyarti.com/"
 
 # 프로그램 버전과 네이비즘 비교 기준 사이트 보정값
-APP_VERSION = "1.4.0"
+APP_VERSION = "1.5.0"
 SERVER_TIME_ADJUSTMENT_MS = 0
 USE_HTTP_SERVER_SECOND_OFFSET = False
 
@@ -25,6 +27,10 @@ USE_HTTP_SERVER_SECOND_OFFSET = False
 # 입력 예시: "2026-07-30 12:00:00.000"
 TARGET_CLICK_TIME = "2026-07-30 12:00:00.000"
 CLICK_MAX_LATE_SECONDS = 2
+CLICK_NOT_BEFORE_MS = 20
+
+# 프로그램에서 변경한 목표시각을 저장할 파일
+SETTINGS_PATH = Path(__file__).with_name("settings.json")
 
 # 서버 시간 재동기화 간격(초)과 한 번에 측정할 횟수
 SYNC_INTERVAL_SECONDS = 10
@@ -39,6 +45,74 @@ NTP_EPOCH_DELTA = 2_208_988_800
 
 # 화면 시간 갱신 간격(밀리초)
 DISPLAY_INTERVAL_MS = 10
+
+
+TARGET_PART_NAMES = (
+    "year",
+    "month",
+    "day",
+    "hour",
+    "minute",
+    "second",
+    "millisecond",
+)
+
+
+def target_parts_from_text(target_text):
+    target = datetime.strptime(target_text, "%Y-%m-%d %H:%M:%S.%f")
+    return {
+        "year": str(target.year),
+        "month": f"{target.month:02d}",
+        "day": f"{target.day:02d}",
+        "hour": f"{target.hour:02d}",
+        "minute": f"{target.minute:02d}",
+        "second": f"{target.second:02d}",
+        "millisecond": f"{target.microsecond // 1000:03d}",
+    }
+
+
+def target_text_from_parts(parts):
+    millisecond = int(parts["millisecond"])
+    if not 0 <= millisecond <= 999:
+        raise ValueError("millisecond out of range")
+
+    target = datetime(
+        int(parts["year"]),
+        int(parts["month"]),
+        int(parts["day"]),
+        int(parts["hour"]),
+        int(parts["minute"]),
+        int(parts["second"]),
+        millisecond * 1000,
+    )
+    return target.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
+
+
+def load_target_parts():
+    default_parts = target_parts_from_text(TARGET_CLICK_TIME)
+    try:
+        saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+        saved_parts = {
+            name: str(saved[name]).strip()
+            for name in TARGET_PART_NAMES
+        }
+        return target_parts_from_text(target_text_from_parts(saved_parts))
+    except (
+        OSError,
+        KeyError,
+        OverflowError,
+        TypeError,
+        ValueError,
+        json.JSONDecodeError,
+    ):
+        return default_parts
+
+
+def save_target_parts(parts):
+    SETTINGS_PATH.write_text(
+        json.dumps(parts, ensure_ascii=False, indent=2) + "\n",
+        encoding="utf-8",
+    )
 
 
 def get_cursor_position():
@@ -114,6 +188,14 @@ class ScheduledLeftClick:
             )
         return True
 
+    def reject(self, status):
+        with self._lock:
+            self._generation += 1
+            self.target_utc = None
+            self.completed = True
+            self.triggered = False
+            self.status = status
+
     def check(self):
         with self._lock:
             if self.completed or self.target_utc is None:
@@ -129,8 +211,11 @@ class ScheduledLeftClick:
             return None
 
         remaining_seconds = (target_utc - server_utc).total_seconds()
-        if remaining_seconds > 0:
-            return remaining_seconds
+        safe_remaining_seconds = (
+            remaining_seconds + CLICK_NOT_BEFORE_MS / 1000
+        )
+        if safe_remaining_seconds > 0:
+            return safe_remaining_seconds
 
         if -remaining_seconds > CLICK_MAX_LATE_SECONDS:
             with self._lock:
@@ -428,14 +513,16 @@ class ServerTimeViewer(tk.Tk):
     def __init__(self):
         super().__init__()
         self.title(f"실시간 서버 시간 v{APP_VERSION}")
-        self.geometry("520x350")
+        self.geometry("520x380")
         self.resizable(False, False)
         self.overrideredirect(True)
 
+        saved_target_parts = load_target_parts()
+        saved_target_text = target_text_from_parts(saved_target_parts)
         self.clock = ServerClock(SERVER_URL)
         self.click_scheduler = ScheduledLeftClick(
             self.clock,
-            TARGET_CLICK_TIME,
+            saved_target_text,
             click_current_position,
         )
         self._running = True
@@ -449,7 +536,10 @@ class ServerTimeViewer(tk.Tk):
         self.date_text = tk.StringVar(value="----년 --월 --일")
         self.status_text = tk.StringVar(value="서버 시간 동기화 대기 중")
         self.latency_text = tk.StringVar(value="응답 지연: -- ms")
-        self.target_time_text = tk.StringVar(value=TARGET_CLICK_TIME)
+        self.target_part_text = {
+            name: tk.StringVar(value=saved_target_parts[name])
+            for name in TARGET_PART_NAMES
+        }
         self.schedule_text = tk.StringVar(
             value=self.click_scheduler.status
         )
@@ -546,16 +636,35 @@ class ServerTimeViewer(tk.Tk):
 
         schedule_frame = ttk.Frame(frame)
         schedule_frame.pack(fill="x", pady=(0, 10))
-        ttk.Label(schedule_frame, text="목표 클릭 시각").pack(side="left")
-        target_entry = ttk.Entry(
-            schedule_frame,
-            textvariable=self.target_time_text,
-            width=26,
+        ttk.Label(schedule_frame, text="목표 클릭 시각").pack(anchor="w")
+        target_input_frame = ttk.Frame(schedule_frame)
+        target_input_frame.pack(fill="x", pady=(4, 0))
+
+        target_fields = (
+            ("year", "년", 5),
+            ("month", "월", 3),
+            ("day", "일", 3),
+            ("hour", "시", 3),
+            ("minute", "분", 3),
+            ("second", "초", 3),
+            ("millisecond", "ms", 4),
         )
-        target_entry.pack(side="left", fill="x", expand=True, padx=(8, 6))
-        target_entry.bind("<Return>", self._apply_click_schedule)
+        for name, label, width in target_fields:
+            target_entry = ttk.Entry(
+                target_input_frame,
+                textvariable=self.target_part_text[name],
+                width=width,
+                justify="center",
+            )
+            target_entry.pack(side="left", padx=(0, 2))
+            target_entry.bind("<Return>", self._apply_click_schedule)
+            ttk.Label(target_input_frame, text=label).pack(
+                side="left",
+                padx=(0, 4),
+            )
+
         ttk.Button(
-            schedule_frame,
+            target_input_frame,
             text="예약 적용",
             command=self._apply_click_schedule,
         ).pack(side="right")
@@ -567,7 +676,25 @@ class ServerTimeViewer(tk.Tk):
         ttk.Label(frame, textvariable=self.cursor_text).pack(anchor="w")
 
     def _apply_click_schedule(self, _event=None):
-        self.click_scheduler.arm(self.target_time_text.get())
+        entered_parts = {
+            name: value.get().strip()
+            for name, value in self.target_part_text.items()
+        }
+        try:
+            target_text = target_text_from_parts(entered_parts)
+            normalized_parts = target_parts_from_text(target_text)
+            save_target_parts(normalized_parts)
+        except (OSError, OverflowError, TypeError, ValueError) as error:
+            self.click_scheduler.reject(
+                f"좌클릭 예약 오류: 날짜/시간 또는 설정 파일 확인 ({error})"
+            )
+            self.schedule_text.set(self.click_scheduler.status)
+            return
+
+        for name, value in normalized_parts.items():
+            self.target_part_text[name].set(value)
+
+        self.click_scheduler.arm(target_text)
         self.schedule_text.set(self.click_scheduler.status)
 
     def _sync_loop(self):
