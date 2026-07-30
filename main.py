@@ -19,7 +19,7 @@ from urllib.request import Request, urlopen
 SERVER_URL = "https://store.frommyarti.com/"
 
 # 프로그램 버전
-APP_VERSION = "1.6.0"
+APP_VERSION = "1.7.0"
 
 # 예약 좌클릭 설정입니다. 빈 시각은 예약 기능을 비활성화합니다.
 # 입력 예시: "2026-07-30 12:00:00.000"
@@ -32,8 +32,10 @@ SETTINGS_PATH = Path(__file__).with_name("settings.json")
 
 # 서버 시간 재동기화 간격(초)과 한 번에 측정할 횟수
 SYNC_INTERVAL_SECONDS = 10
-SYNC_SAMPLE_COUNT = 5
-SERVER_OFFSET_CONFIRMATIONS = 3
+SYNC_SAMPLE_COUNT = 8
+SITE_PHASE_HISTORY_SIZE = 5
+SITE_PHASE_MAX_RANGE_MS = 500
+HTTP_RELIABLE_LATENCY_MARGIN_MS = 100
 
 # PC 시계의 밀리초 오차를 자동 보정할 NTP 설정
 NTP_SERVERS = (
@@ -271,10 +273,8 @@ class ServerClock:
         self._synced_monotonic = None
         self._latency_ms = None
         self._ntp_offset_seconds = None
-        self._stable_server_offset_seconds = 0
-        self._pending_server_offset_seconds = None
-        self._pending_offset_confirmations = 0
-        self._offset_status = ""
+        self._site_phase_seconds = 0.0
+        self._site_phase_history = []
         self._status = "서버 시간 동기화 대기 중"
 
     def _fetch_ntp_sample(self, ntp_server):
@@ -362,44 +362,45 @@ class ServerClock:
             "finished_monotonic_ns": finished_monotonic_ns,
         }
 
-    def _select_stable_server_offset(self, measured_offset, samples):
-        if measured_offset == self._stable_server_offset_seconds:
-            self._pending_server_offset_seconds = None
-            self._pending_offset_confirmations = 0
-            self._offset_status = ""
-            return self._stable_server_offset_seconds
-
-        measured_count = sum(
-            sample["offset_seconds"] == measured_offset
+    def _estimate_site_phase(self, samples, ntp_offset_seconds):
+        minimum_latency_ns = min(
+            sample["latency_ns"] for sample in samples
+        )
+        reliable_samples = [
+            sample
             for sample in samples
-        )
-        if measured_count != len(samples):
-            self._pending_server_offset_seconds = None
-            self._pending_offset_confirmations = 0
-            self._offset_status = ""
-            return self._stable_server_offset_seconds
+            if sample["latency_ns"]
+            <= minimum_latency_ns
+            + HTTP_RELIABLE_LATENCY_MARGIN_MS * 1_000_000
+        ]
 
-        if self._pending_server_offset_seconds == measured_offset:
-            self._pending_offset_confirmations += 1
-        else:
-            self._pending_server_offset_seconds = measured_offset
-            self._pending_offset_confirmations = 1
+        lower_bounds = []
+        upper_bounds = []
+        for sample in reliable_samples:
+            corrected_midpoint = (
+                sample["midpoint_wall_ns"] / 1_000_000_000
+                + ntp_offset_seconds
+            )
+            lower_bounds.append(
+                sample["server_second"] - corrected_midpoint
+            )
+            upper_bounds.append(
+                sample["server_second"] + 1 - corrected_midpoint
+            )
 
-        self._offset_status = (
-            f", 초 확인 {self._pending_offset_confirmations}"
-            f"/{SERVER_OFFSET_CONFIRMATIONS}"
-        )
+        lower_bound = max(lower_bounds)
+        upper_bound = min(upper_bounds)
+        phase_range_seconds = upper_bound - lower_bound
         if (
-            self._pending_offset_confirmations
-            < SERVER_OFFSET_CONFIRMATIONS
+            phase_range_seconds <= 0
+            or phase_range_seconds * 1000 > SITE_PHASE_MAX_RANGE_MS
         ):
-            return self._stable_server_offset_seconds
+            return None, reliable_samples
 
-        self._stable_server_offset_seconds = measured_offset
-        self._pending_server_offset_seconds = None
-        self._pending_offset_confirmations = 0
-        self._offset_status = ""
-        return self._stable_server_offset_seconds
+        return (
+            (lower_bound + upper_bound) / 2,
+            reliable_samples,
+        )
 
     def sync(self):
         ntp_samples = []
@@ -450,41 +451,38 @@ class ServerClock:
                 self._status = f"동기화 실패: {last_error}"
             return
 
-        for sample in samples:
-            corrected_midpoint_second = int(
-                sample["midpoint_wall_ns"] / 1_000_000_000
-                + ntp_offset_seconds
-            )
-            sample["offset_seconds"] = (
-                sample["server_second"] - corrected_midpoint_second
-            )
-
-        measured_offset = int(
-            median(sample["offset_seconds"] for sample in samples)
+        measured_site_phase, reliable_samples = (
+            self._estimate_site_phase(samples, ntp_offset_seconds)
         )
-        selected_offset = 0
-        self._stable_server_offset_seconds = 0
-        self._pending_server_offset_seconds = None
-        self._pending_offset_confirmations = 0
-        self._offset_status = ""
-        server_offset_status = "서버 보정 없음"
-        matching_samples = [
-            sample
-            for sample in samples
-            if sample["offset_seconds"] in (
-                selected_offset,
-                measured_offset,
+        if measured_site_phase is not None:
+            self._site_phase_history.append(measured_site_phase)
+            self._site_phase_history = self._site_phase_history[
+                -SITE_PHASE_HISTORY_SIZE:
+            ]
+            self._site_phase_seconds = median(
+                self._site_phase_history
             )
-        ]
+            site_status = (
+                f"사이트 자동 "
+                f"{self._site_phase_seconds * 1000:+.1f} ms"
+            )
+        elif self._site_phase_history:
+            site_status = (
+                f"사이트 재사용 "
+                f"{self._site_phase_seconds * 1000:+.1f} ms"
+            )
+        else:
+            site_status = "사이트 경계 확인 중 (NTP 기준)"
+
         best_sample = min(
-            matching_samples or samples,
+            reliable_samples,
             key=lambda sample: sample["latency_ns"],
         )
 
         estimated_server_timestamp = (
             best_sample["finished_wall_ns"] / 1_000_000_000
             + ntp_offset_seconds
-            + selected_offset
+            + self._site_phase_seconds
         )
         estimated_server_utc = datetime.fromtimestamp(
             estimated_server_timestamp,
@@ -499,7 +497,7 @@ class ServerClock:
             self._latency_ms = best_sample["latency_ns"] / 1_000_000
             self._status = (
                 f"동기화 정상 | {ntp_status} | "
-                f"{server_offset_status}{self._offset_status}"
+                f"{site_status}"
             )
 
     def snapshot(self):
