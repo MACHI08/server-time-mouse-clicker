@@ -12,6 +12,7 @@ from pathlib import Path
 from statistics import median
 from tkinter import ttk
 from urllib.error import HTTPError, URLError
+from urllib.parse import urlparse
 from urllib.request import Request, urlopen
 
 
@@ -19,7 +20,7 @@ from urllib.request import Request, urlopen
 SERVER_URL = "https://store.frommyarti.com/"
 
 # 프로그램 버전
-APP_VERSION = "1.7.0"
+APP_VERSION = "1.8.0"
 
 # 예약 좌클릭 설정입니다. 빈 시각은 예약 기능을 비활성화합니다.
 # 입력 예시: "2026-07-30 12:00:00.000"
@@ -93,29 +94,56 @@ def target_text_from_parts(parts):
     return target.strftime("%Y-%m-%d %H:%M:%S.%f")[:-3]
 
 
-def load_target_parts():
+def normalize_server_url(url):
+    normalized_url = url.strip()
+    parsed_url = urlparse(normalized_url)
+    if (
+        parsed_url.scheme not in ("http", "https")
+        or not parsed_url.netloc
+    ):
+        raise ValueError("http 또는 https 주소를 입력하세요.")
+    return normalized_url
+
+
+def load_settings():
     default_parts = target_parts_from_text(TARGET_CLICK_TIME)
     try:
         saved = json.loads(SETTINGS_PATH.read_text(encoding="utf-8"))
+    except (OSError, TypeError, ValueError, json.JSONDecodeError):
+        saved = {}
+
+    try:
         saved_parts = {
             name: str(saved[name]).strip()
             for name in TARGET_PART_NAMES
         }
-        return target_parts_from_text(target_text_from_parts(saved_parts))
+        target_parts = target_parts_from_text(
+            target_text_from_parts(saved_parts)
+        )
     except (
-        OSError,
         KeyError,
         OverflowError,
         TypeError,
         ValueError,
-        json.JSONDecodeError,
     ):
-        return default_parts
+        target_parts = default_parts
+
+    try:
+        target_url = normalize_server_url(
+            str(saved.get("target_url", SERVER_URL))
+        )
+    except (TypeError, ValueError):
+        target_url = SERVER_URL
+    return target_parts, target_url
 
 
-def save_target_parts(parts):
+def save_settings(parts, target_url):
+    settings = {
+        "target_url": normalize_server_url(target_url),
+        **parts,
+    }
     SETTINGS_PATH.write_text(
-        json.dumps(parts, ensure_ascii=False, indent=2) + "\n",
+        json.dumps(settings, ensure_ascii=False, indent=2) + "\n",
         encoding="utf-8",
     )
 
@@ -269,6 +297,7 @@ class ServerClock:
     def __init__(self, url):
         self.url = url
         self._lock = threading.Lock()
+        self._url_generation = 0
         self._server_utc = None
         self._synced_monotonic = None
         self._latency_ms = None
@@ -276,6 +305,21 @@ class ServerClock:
         self._site_phase_seconds = 0.0
         self._site_phase_history = []
         self._status = "서버 시간 동기화 대기 중"
+
+    def set_url(self, url):
+        with self._lock:
+            self.url = url
+            self._url_generation += 1
+            self._server_utc = None
+            self._synced_monotonic = None
+            self._latency_ms = None
+            self._site_phase_seconds = 0.0
+            self._site_phase_history = []
+            self._status = "새 대상 서버 동기화 대기 중"
+
+    def get_url(self):
+        with self._lock:
+            return self.url
 
     def _fetch_ntp_sample(self, ntp_server):
         packet = b"\x1b" + 47 * b"\0"
@@ -310,12 +354,12 @@ class ServerClock:
             "delay_seconds": max(0.0, network_delay_seconds),
         }
 
-    def _fetch_sample(self):
+    def _fetch_sample(self, target_url):
         started_wall_ns = time.time_ns()
         started_monotonic_ns = time.perf_counter_ns()
 
         request = Request(
-            self.url,
+            target_url,
             method="HEAD",
             headers={
                 "User-Agent": "Mozilla/5.0 ServerTimeViewer/1.0",
@@ -328,7 +372,7 @@ class ServerClock:
             if error.code not in (405, 501):
                 raise
             request = Request(
-                self.url,
+                target_url,
                 method="GET",
                 headers={
                     "User-Agent": "Mozilla/5.0 ServerTimeViewer/1.0",
@@ -403,6 +447,10 @@ class ServerClock:
         )
 
     def sync(self):
+        with self._lock:
+            target_url = self.url
+            url_generation = self._url_generation
+
         ntp_samples = []
         for index in range(NTP_SAMPLE_COUNT):
             ntp_server = NTP_SERVERS[index % len(NTP_SERVERS)]
@@ -442,13 +490,14 @@ class ServerClock:
 
         for _ in range(SYNC_SAMPLE_COUNT):
             try:
-                samples.append(self._fetch_sample())
+                samples.append(self._fetch_sample(target_url))
             except (HTTPError, URLError, ValueError, TimeoutError) as error:
                 last_error = error
 
         if not samples:
             with self._lock:
-                self._status = f"동기화 실패: {last_error}"
+                if url_generation == self._url_generation:
+                    self._status = f"동기화 실패: {last_error}"
             return
 
         measured_site_phase, reliable_samples = (
@@ -490,6 +539,8 @@ class ServerClock:
         )
 
         with self._lock:
+            if url_generation != self._url_generation:
+                return
             self._server_utc = estimated_server_utc
             self._synced_monotonic = (
                 best_sample["finished_monotonic_ns"] / 1_000_000_000
@@ -518,9 +569,9 @@ class ServerTimeViewer(tk.Tk):
         self.resizable(False, False)
         self.overrideredirect(True)
 
-        saved_target_parts = load_target_parts()
+        saved_target_parts, saved_target_url = load_settings()
         saved_target_text = target_text_from_parts(saved_target_parts)
-        self.clock = ServerClock(SERVER_URL)
+        self.clock = ServerClock(saved_target_url)
         self.click_scheduler = ScheduledLeftClick(
             self.clock,
             saved_target_text,
@@ -531,8 +582,9 @@ class ServerTimeViewer(tk.Tk):
         self._drag_offset_x = 0
         self._drag_offset_y = 0
         self._restore_override_pending = False
+        self._sync_requested = threading.Event()
 
-        self.url_text = tk.StringVar(value=SERVER_URL)
+        self.url_text = tk.StringVar(value=saved_target_url)
         self.time_text = tk.StringVar(value="--:--:--.---")
         self.date_text = tk.StringVar(value="----년 --월 --일")
         self.status_text = tk.StringVar(value="서버 시간 동기화 대기 중")
@@ -618,11 +670,19 @@ class ServerTimeViewer(tk.Tk):
         frame.pack(fill="both", expand=True)
 
         ttk.Label(frame, text="대상 서버").pack(anchor="w")
-        ttk.Label(
-            frame,
+        server_frame = ttk.Frame(frame)
+        server_frame.pack(fill="x", pady=(2, 14))
+        server_entry = ttk.Entry(
+            server_frame,
             textvariable=self.url_text,
-            foreground="#555555",
-        ).pack(anchor="w", pady=(2, 14))
+        )
+        server_entry.pack(side="left", fill="x", expand=True, padx=(0, 6))
+        server_entry.bind("<Return>", self._apply_server_url)
+        ttk.Button(
+            server_frame,
+            text="주소 적용",
+            command=self._apply_server_url,
+        ).pack(side="right")
 
         ttk.Label(
             frame,
@@ -676,6 +736,20 @@ class ServerTimeViewer(tk.Tk):
         ttk.Label(frame, textvariable=self.schedule_text).pack(anchor="w")
         ttk.Label(frame, textvariable=self.cursor_text).pack(anchor="w")
 
+    def _apply_server_url(self, _event=None):
+        try:
+            target_url = normalize_server_url(self.url_text.get())
+            saved_target_parts, _ = load_settings()
+            save_settings(saved_target_parts, target_url)
+        except (OSError, TypeError, ValueError) as error:
+            self.status_text.set(f"대상 서버 주소 오류: {error}")
+            return
+
+        self.url_text.set(target_url)
+        self.clock.set_url(target_url)
+        self.status_text.set(self.clock.snapshot()[1])
+        self._sync_requested.set()
+
     def _apply_click_schedule(self, _event=None):
         entered_parts = {
             name: value.get().strip()
@@ -684,7 +758,7 @@ class ServerTimeViewer(tk.Tk):
         try:
             target_text = target_text_from_parts(entered_parts)
             normalized_parts = target_parts_from_text(target_text)
-            save_target_parts(normalized_parts)
+            save_settings(normalized_parts, self.clock.get_url())
         except (OSError, OverflowError, TypeError, ValueError) as error:
             self.click_scheduler.reject(
                 f"좌클릭 예약 오류: 날짜/시간 또는 설정 파일 확인 ({error})"
@@ -701,10 +775,10 @@ class ServerTimeViewer(tk.Tk):
     def _sync_loop(self):
         while self._running:
             self.clock.sync()
-            for _ in range(SYNC_INTERVAL_SECONDS * 10):
-                if not self._running:
-                    return
-                time.sleep(0.1)
+            self._sync_requested.wait(SYNC_INTERVAL_SECONDS)
+            self._sync_requested.clear()
+            if not self._running:
+                return
 
     def _render_display(self):
         server_utc, status, latency_ms = self.clock.snapshot()
@@ -787,6 +861,7 @@ class ServerTimeViewer(tk.Tk):
 
     def _close(self):
         self._running = False
+        self._sync_requested.set()
         self.destroy()
 
 
